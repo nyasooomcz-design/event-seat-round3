@@ -1,0 +1,148 @@
+name: スプレッドシートからデータ更新
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: スプレッドシートからCSV取得してJSONに変換
+        run: |
+          SPREADSHEET_ID="187g4dMgxt094oImBQgwiOVJxq--Aid0OQHNIgqn3Nsg"
+          GID="1790222964"
+          CSV_URL="https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=${GID}"
+
+          curl -L -o data.csv "${CSV_URL}"
+
+          python3 << 'PYTHON'
+          import csv, json, re, sys
+
+          VALID_TABLES = set()
+          for col in "ABCDE":
+              for n in range(1, 13):
+                  VALID_TABLES.add(f"{col}-{n}")
+
+          with open("data.csv", "r", encoding="utf-8") as f:
+              reader = list(csv.reader(f))
+
+          description = ""
+          if len(reader) > 1:
+              description = reader[1][0].strip() if reader[1] else ""
+
+          data = []
+          warnings = []
+          header_found = False
+          for row in reader:
+              if not header_found:
+                  if row and row[0].strip() == "リベシティ名":
+                      header_found = True
+                  continue
+              name = row[0].strip() if len(row) > 0 else ""
+              if not name:
+                  continue
+              table1 = row[2].strip() if len(row) > 2 else ""
+              table2 = row[3].strip() if len(row) > 3 else ""
+
+              if table1 and table1 not in VALID_TABLES:
+                  warnings.append(f"{name}: グループ①「{table1}」が不正です")
+              if table2 and table2 not in VALID_TABLES:
+                  warnings.append(f"{name}: グループ②「{table2}」が不正です")
+
+              entry = {
+                  "name": name,
+                  "url": row[1].strip() if len(row) > 1 else "",
+                  "table1": table1,
+                  "table2": table2
+              }
+              data.append(entry)
+
+          result = {
+              "description": description,
+              "updatedAt": "",
+              "warnings": warnings,
+              "data": data
+          }
+
+          with open("data.json", "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
+
+          print(f"変換完了: {len(data)}件")
+          if warnings:
+              print(f"⚠ 不正テーブルID: {len(warnings)}件")
+              for w in warnings[:10]:
+                  print(f"  {w}")
+              if len(warnings) > 10:
+                  print(f"  ...他 {len(warnings) - 10}件")
+          PYTHON
+
+      - name: 更新日時をJSONに記録
+        run: |
+          python3 -c "
+          import json
+          from datetime import datetime, timezone, timedelta
+          jst = timezone(timedelta(hours=9))
+          now = datetime.now(jst).strftime('%Y-%m-%d %H:%M')
+          with open('data.json', 'r', encoding='utf-8') as f:
+              d = json.load(f)
+          d['updatedAt'] = now
+          with open('data.json', 'w', encoding='utf-8') as f:
+              json.dump(d, f, ensure_ascii=False, indent=2)
+          print(f'更新日時: {now}')
+          "
+
+      - name: 不正テーブルIDがあればChatworkアラート
+        if: always()
+        env:
+          CHATWORK_API_TOKEN: ${{ secrets.CHATWORK_API_TOKEN }}
+        run: |
+          python3 << 'PYTHON'
+          import json, urllib.request, urllib.parse, os
+
+          with open("data.json", "r", encoding="utf-8") as f:
+              d = json.load(f)
+
+          warnings = d.get("warnings", [])
+          if not warnings:
+              print("不正テーブルIDなし。アラート不要。")
+              exit(0)
+
+          body = "[To:10185734]おいね@オン秘書さん\n"
+          body += "[info][title]⚠ ミニフェス3回目 座席データ：不正テーブルID検出[/title]"
+          body += f"スプレッドシートに、レイアウト（A-1〜E-12）に存在しないテーブルIDが {len(warnings)}件 見つかりました。\n\n"
+          for w in warnings[:20]:
+              body += f"・{w}\n"
+          if len(warnings) > 20:
+              body += f"\n...他 {len(warnings) - 20}件\n"
+          body += "\nスプレッドシートを確認・修正のうえ、再度ワークフローを実行してください。[/info]"
+
+          token = os.environ.get("CHATWORK_API_TOKEN", "")
+          if not token:
+              print("CHATWORK_API_TOKEN未設定。アラートスキップ。")
+              exit(0)
+
+          room_id = 418948997
+          url = f"https://api.chatwork.com/v2/rooms/{room_id}/messages"
+          data = urllib.parse.urlencode({"body": body, "self_unread": 1}).encode()
+          req = urllib.request.Request(url, data=data, headers={"X-ChatWorkToken": token})
+          try:
+              resp = urllib.request.urlopen(req)
+              print(f"Chatworkアラート送信成功: {resp.read().decode()}")
+          except Exception as e:
+              print(f"Chatworkアラート送信失敗: {e}")
+          PYTHON
+
+      - name: 変更があればコミット＆プッシュ
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git diff --cached --quiet && echo "変更なし" && exit 0
+          git commit -m "データ更新: $(date '+%Y-%m-%d %H:%M' -d '+9 hours')"
+          git pull --rebase origin main
+          git push
